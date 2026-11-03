@@ -1,0 +1,492 @@
+openapi: 3.1.0
+info:
+  title: Keyloop Unified Service Scheduler API
+  version: 1.0.0
+  description: |
+    Contract between the Service Scheduler web app and its backend. In this version the
+    backend is mocked in the browser (MSW) but MUST honour this contract exactly.
+
+    Conventions
+    - All instants are ISO-8601 UTC (`2026-11-03T10:00:00Z`).
+    - Time windows are half-open `[start, end)`.
+    - Every request MAY send `X-Correlation-Id` and `traceparent`; every response echoes
+      `X-Correlation-Id`.
+    - Errors use RFC 9457 `application/problem+json`.
+  license:
+    name: Proprietary (assessment use only)
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: /api
+# Authentication is out of scope for v1 (spec Assumptions); a real backend would add an
+# OAuth2/OIDC bearer scheme here without changing any operation shapes.
+security: []
+tags:
+  - name: Reference
+    description: Dealerships and the service types they offer
+  - name: Customers
+    description: Customer and vehicle lookup (read-only, seeded)
+  - name: Availability
+    description: Real-time bay and technician availability checks
+  - name: Appointments
+    description: Booking, listing and cancelling appointments
+
+paths:
+  /dealerships:
+    get:
+      tags: [Reference]
+      operationId: listDealerships
+      summary: List dealerships
+      responses:
+        '200':
+          description: All dealerships
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Dealership' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /dealerships/{dealershipId}/service-types:
+    get:
+      tags: [Reference]
+      operationId: listServiceTypes
+      summary: List service types offered by a dealership
+      parameters:
+        - $ref: '#/components/parameters/DealershipId'
+      responses:
+        '200':
+          description: Service types offered by the dealership
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ServiceType' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /customers:
+    get:
+      tags: [Customers]
+      operationId: searchCustomers
+      summary: Search customers with their vehicles
+      description: Case-insensitive match on full name, phone digits or email (FR-001).
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 100 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        '200':
+          description: Matching customers with their vehicles
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Customer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /availability/check:
+    post:
+      tags: [Availability]
+      operationId: checkAvailability
+      summary: Check bay and technician availability
+      description: |
+        Read-only check (FR-005..FR-010). Returns a proposed technician and bay when available,
+        otherwise the reason and up to 5 nearest alternative start times within 7 days.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AvailabilityRequest' }
+      responses:
+        '200':
+          description: Availability result (available or not — both are 200)
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AvailabilityResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /appointments:
+    get:
+      tags: [Appointments]
+      operationId: listAppointments
+      summary: List appointments for a dealership and date
+      description: Appointments for one dealership and one local date, ordered by start (FR-015).
+      parameters:
+        - name: dealershipId
+          in: query
+          required: true
+          schema: { type: string }
+        - name: date
+          in: query
+          required: true
+          description: Local date in the dealership's time zone.
+          schema: { type: string, format: date }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/AppointmentStatus' }
+      responses:
+        '200':
+          description: Appointments ordered by start ascending
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AppointmentView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+    post:
+      tags: [Appointments]
+      operationId: createAppointment
+      summary: Confirm a new appointment
+      description: |
+        Re-validates availability for the exact technician and bay the user reviewed and creates
+        a CONFIRMED appointment atomically (FR-011..FR-014). Idempotent per `Idempotency-Key`:
+        a repeated key with an identical body returns the original 201 response; a repeated key
+        with a different body returns 422.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAppointmentRequest' }
+      responses:
+        '201':
+          description: Appointment confirmed (or idempotent replay of the original)
+          headers:
+            X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' }
+            Location:
+              schema: { type: string }
+            Idempotent-Replayed:
+              description: '`true` when this response is a replay.'
+              schema: { type: boolean }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppointmentView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Slot or proposed resources no longer available
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ConflictProblem' }
+        '422':
+          description: Business-rule violation (past start, outside hours, idempotency key reuse, vehicle not owned by customer…)
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /appointments/{appointmentId}:
+    get:
+      tags: [Appointments]
+      operationId: getAppointment
+      summary: Get an appointment
+      parameters:
+        - $ref: '#/components/parameters/AppointmentId'
+      responses:
+        '200':
+          description: The appointment
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppointmentView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+  /appointments/{appointmentId}/cancel:
+    post:
+      tags: [Appointments]
+      operationId: cancelAppointment
+      summary: Cancel an appointment
+      description: Idempotent. Cancelling an already cancelled appointment returns 200 unchanged (FR-016).
+      parameters:
+        - $ref: '#/components/parameters/AppointmentId'
+      responses:
+        '200':
+          description: Appointment is cancelled
+          headers: { X-Correlation-Id: { $ref: '#/components/headers/CorrelationId' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppointmentView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/ServerError' }
+
+components:
+  headers:
+    CorrelationId:
+      description: Correlation id echoed from the request or generated by the server.
+      schema: { type: string }
+
+  parameters:
+    DealershipId:
+      name: dealershipId
+      in: path
+      required: true
+      schema: { type: string }
+    AppointmentId:
+      name: appointmentId
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request / schema validation failure
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Referenced resource does not exist
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ServerError:
+      description: Unexpected error
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Instant:
+      type: string
+      format: date-time
+      description: ISO-8601 UTC instant
+      examples: ['2026-11-03T10:00:00Z']
+
+    Skill:
+      type: string
+      enum: [GENERAL_MAINTENANCE, BRAKES, EV_SYSTEMS, DIAGNOSTICS, ALIGNMENT]
+
+    BayType:
+      type: string
+      enum: [GENERAL, EV, ALIGNMENT]
+
+    Dealership:
+      type: object
+      required: [id, name, timeZone, openingHours, openDays]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        timeZone: { type: string, examples: ['Europe/London'] }
+        openingHours:
+          type: object
+          required: [open, close]
+          properties:
+            open: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$' }
+            close: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$' }
+        openDays:
+          type: array
+          items: { type: integer, minimum: 1, maximum: 7 }
+          minItems: 1
+
+    ServiceType:
+      type: object
+      required: [id, name, durationMinutes, requiredSkill, requiredBayType]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        durationMinutes: { type: integer, minimum: 15, multipleOf: 15 }
+        requiredSkill: { $ref: '#/components/schemas/Skill' }
+        requiredBayType: { $ref: '#/components/schemas/BayType' }
+
+    Vehicle:
+      type: object
+      required: [id, vin, make, model, year]
+      properties:
+        id: { type: string }
+        vin: { type: string, pattern: '^[A-HJ-NPR-Z0-9]{17}$' }
+        make: { type: string }
+        model: { type: string }
+        year: { type: integer }
+
+    Customer:
+      type: object
+      required: [id, firstName, lastName, phone, email, vehicles]
+      properties:
+        id: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+        phone: { type: string }
+        email: { type: string, format: email }
+        vehicles:
+          type: array
+          items: { $ref: '#/components/schemas/Vehicle' }
+
+    ResourceRef:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+
+    AvailabilityRequest:
+      type: object
+      required: [dealershipId, serviceTypeId, start]
+      properties:
+        dealershipId: { type: string }
+        serviceTypeId: { type: string }
+        start: { $ref: '#/components/schemas/Instant' }
+
+    UnavailableReason:
+      type: string
+      enum:
+        - SERVICE_NOT_OFFERED
+        - START_IN_PAST
+        - DEALERSHIP_CLOSED
+        - OUTSIDE_OPENING_HOURS
+        - NO_QUALIFIED_TECHNICIAN
+        - NO_COMPATIBLE_BAY
+        - PROPOSED_RESOURCE_TAKEN
+      description: |
+        `PROPOSED_RESOURCE_TAKEN` is only returned by `createAppointment` (409) when the reviewed
+        technician or bay was taken but the slot may still be bookable with other resources;
+        in that case the requested start is the first entry of `alternatives`.
+
+    TimeWindow:
+      type: object
+      required: [start, end]
+      properties:
+        start: { $ref: '#/components/schemas/Instant' }
+        end: { $ref: '#/components/schemas/Instant' }
+
+    AvailabilityResult:
+      oneOf:
+        - $ref: '#/components/schemas/Available'
+        - $ref: '#/components/schemas/Unavailable'
+      description: Narrow on the boolean `available` (no `discriminator`, which code generators type as a string).
+
+    Available:
+      type: object
+      required: [available, window, technician, bay]
+      properties:
+        available: { const: true }
+        window: { $ref: '#/components/schemas/TimeWindow' }
+        technician: { $ref: '#/components/schemas/ResourceRef' }
+        bay: { $ref: '#/components/schemas/ResourceRef' }
+
+    Unavailable:
+      type: object
+      required: [available, window, reason, alternatives]
+      properties:
+        available: { const: false }
+        window: { $ref: '#/components/schemas/TimeWindow' }
+        reason: { $ref: '#/components/schemas/UnavailableReason' }
+        alternatives:
+          type: array
+          maxItems: 5
+          description: Nearest valid start times (≤ 7 days), ordered by distance from requested start. Empty = none found.
+          items: { $ref: '#/components/schemas/Instant' }
+
+    CreateAppointmentRequest:
+      type: object
+      required: [customerId, vehicleId, dealershipId, serviceTypeId, start, technicianId, bayId]
+      properties:
+        customerId: { type: string }
+        vehicleId: { type: string }
+        dealershipId: { type: string }
+        serviceTypeId: { type: string }
+        start: { $ref: '#/components/schemas/Instant' }
+        technicianId:
+          type: string
+          description: Technician proposed by the availability check and reviewed by the user.
+        bayId:
+          type: string
+          description: Bay proposed by the availability check and reviewed by the user.
+
+    AppointmentStatus:
+      type: string
+      enum: [CONFIRMED, CANCELLED]
+
+    AppointmentView:
+      type: object
+      required:
+        - id
+        - reference
+        - status
+        - customerId
+        - vehicleId
+        - dealershipId
+        - serviceTypeId
+        - technicianId
+        - bayId
+        - start
+        - end
+        - createdAt
+        - customerName
+        - vehicleLabel
+        - serviceTypeName
+        - technicianName
+        - bayName
+      properties:
+        id: { type: string }
+        reference: { type: string, pattern: '^APT-\d{8}-[A-Z0-9]{4}$' }
+        status: { $ref: '#/components/schemas/AppointmentStatus' }
+        customerId: { type: string }
+        vehicleId: { type: string }
+        dealershipId: { type: string }
+        serviceTypeId: { type: string }
+        technicianId: { type: string }
+        bayId: { type: string }
+        start: { $ref: '#/components/schemas/Instant' }
+        end: { $ref: '#/components/schemas/Instant' }
+        createdAt: { $ref: '#/components/schemas/Instant' }
+        cancelledAt:
+          oneOf:
+            - $ref: '#/components/schemas/Instant'
+            - type: 'null'
+        customerName: { type: string }
+        vehicleLabel: { type: string, examples: ['2022 Toyota Corolla · JTDBR32E720123456'] }
+        serviceTypeName: { type: string }
+        technicianName: { type: string }
+        bayName: { type: string }
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri-reference }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        correlationId: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    ConflictProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          required: [reason, alternatives]
+          properties:
+            reason: { $ref: '#/components/schemas/UnavailableReason' }
+            alternatives:
+              type: array
+              maxItems: 5
+              items: { $ref: '#/components/schemas/Instant' }

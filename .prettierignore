@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+pnpm-lock.yaml
+src/api/schema.gen.ts
+public/mockServiceWorker.js
+specs/
+.specify/
